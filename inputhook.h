@@ -47,18 +47,27 @@ public:
 
 private:
     void resolveFunctions();
+
     void applyHooks();
+
     bool loadKeybinds();
+
     void launch(const std::string& cmd);
+
     [[noreturn]] void watchConfigFile();
+
     std::tuple<Action, int> handleKey(int keycode, int state);
 
     static ssize_t trampoline_write(int fd, input_event_t* events, size_t count);
+
     static int trampoline_lginput(uinput_info_t* info, int keyid, int state);
+
     static int trampoline_MICOM_FuncWriteKeyEvent(int fd, uint16_t type, uint16_t code, int32_t value);
 
     int hook_lginput(uinput_info_t* info, int keyid, int state);
+
     int hook_MICOM_FuncWriteKeyEvent(int fd, uint16_t type, uint16_t code, int32_t value);
+
     ssize_t hook_write(int fd, input_event_t* events, size_t count);
 
     GumInterceptor* m_interceptor{nullptr};
