@@ -41,7 +41,7 @@ jobs:
         run: |
           git clone https://github.com/smx-smx/ezinject
           cd ezinject
-          git pull && git checkout 554b84039b86e7b9fbad674619624fc1af034831
+          git pull && git checkout 607055c06b037eadc3992008940d99bdc4a14f53
           mkdir build && cd build
           cmake -DEZ_LIBC=glibc -DUSE_FRIDA_GUM=1 -DCMAKE_INSTALL_PREFIX=$TOOLCHAIN_DIR/arm-lgtv-linux-gnueabi/sysroot -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE ..
           make -j$(getconf _NPROCESSORS_ONLN) && make install

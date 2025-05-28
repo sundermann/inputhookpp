@@ -247,17 +247,8 @@ ssize_t InputHook::hook_write(const int fd, input_event_t* events, const size_t 
 }
 
 extern "C" {
-int lib_loginit() {
-    const char* tmpfile = "/tmp/inputhook.log";
-    log_config_t cfg = {
-        .verbosity = V_DBG,
-        .log_output = fopen(tmpfile, "w+"),
-        .log_leave_open = true,
-    };
-    setvbuf(cfg.log_output, nullptr, _IONBF, 0);
-
-    log_init(&cfg);
-    return 0;
+int lib_loginit(log_config_t* log_cfg) {
+    return -1;
 }
 
 int lib_preinit(struct injcode_user* user) {
