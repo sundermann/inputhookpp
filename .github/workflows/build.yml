@@ -61,7 +61,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: hyperion_webos_${{ matrix.build-type }}
+          name: inputhookpp_${{ matrix.build-type }}
           path: |
             ${{ github.workspace }}/build/ezinject
             ${{ github.workspace }}/build/*.so
