@@ -5,13 +5,16 @@ on:
   pull_request:
 
 env:
-  TOOLCHAIN_URL: https://github.com/sundermann/buildroot-nc4/releases/download/2025.02-03/linux-intel-lgtv-sdk.tar.gz
-  TOOLCHAIN_SHA256: 8453e05a2e334cac891f41faa8582e43263c711b491256500d126f442c231749
+  TOOLCHAIN_URL: https://github.com/openlgtv/buildroot-nc4/releases/download/2026.08-webos/arm-lgtv-linux-gnueabi_sdk-buildroot-x86_64.tar.gz
+  TOOLCHAIN_SHA256: a8d82460b3a96a96cb2f3847df19d2c641672a9d8facf7141502c29dd86f9000
   TOOLCHAIN_DIR: /opt/arm-lgtv-linux-gnueabi_sdk-buildroot
   TOOLCHAIN_FILE: /opt/arm-lgtv-linux-gnueabi_sdk-buildroot/share/buildroot/toolchainfile.cmake
 
 jobs:
   build-native-component:
+    permissions:
+      contents: write
+
     strategy:
       matrix:
         build-type: [Debug, Release]
@@ -41,9 +44,9 @@ jobs:
         run: |
           git clone https://github.com/smx-smx/ezinject
           cd ezinject
-          git pull && git checkout 607055c06b037eadc3992008940d99bdc4a14f53
+          git checkout 607055c06b037eadc3992008940d99bdc4a14f53
           mkdir build && cd build
-          cmake -DEZ_LIBC=glibc -DUSE_FRIDA_GUM=1 -DCMAKE_INSTALL_PREFIX=$TOOLCHAIN_DIR/arm-lgtv-linux-gnueabi/sysroot -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE ..
+          cmake -DEZ_LIBC=glibc -DUSE_FRIDA_GUM=1 -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} -DCMAKE_INSTALL_PREFIX=$TOOLCHAIN_DIR/arm-lgtv-linux-gnueabi/sysroot -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE ..
           make -j$(getconf _NPROCESSORS_ONLN) && make install
 
       - name: Create Build directory
@@ -52,7 +55,7 @@ jobs:
       - name: Build component
         working-directory: ${{ github.workspace }}/build
         shell: bash
-        run: cmake -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE .. && make inputhookpp
+        run: cmake -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN_FILE .. && cmake --build . --parallel
 
       - name: Copy ezinject
         run: |

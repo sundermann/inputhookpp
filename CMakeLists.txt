@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.30)
 project(inputhookpp)
 
 include(FetchContent)
@@ -9,10 +9,17 @@ find_package(ezinject REQUIRED)
 
 add_ezinject_library(inputhookpp
     USE_LH
-    SOURCES inputhook.cpp
+    SOURCES inputhook.cpp keybindings.cpp
 )
 
-set_property(TARGET inputhookpp PROPERTY CXX_STANDARD 20)
+set_target_properties(inputhookpp PROPERTIES
+    CXX_STANDARD 26
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+)
+target_compile_options(inputhookpp PRIVATE -ffunction-sections -fdata-sections)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FRIDA_GUM_STATIC
         REQUIRED
@@ -66,5 +73,12 @@ set_target_properties(PkgConfig::FRIDA_GUM_STATIC PROPERTIES INTERFACE_LINK_LIBR
 
 target_link_libraries(inputhookpp PkgConfig::FRIDA_GUM_STATIC)
 target_include_directories(inputhookpp PRIVATE ${FRIDA_GUM_INCLUDE_DIRS})
-target_link_options(inputhookpp PRIVATE "-static-libstdc++")
+# Bind bundled runtime and bootstrap symbols to this library.
+target_link_options(inputhookpp PRIVATE
+    "-static-libstdc++"
+    "-Wl,-Bsymbolic"
+    "-Wl,--exclude-libs,ALL"
+    "-Wl,--gc-sections"
+    "$<$<CONFIG:Release>:-Wl,-s>"
+)
 target_link_libraries(inputhookpp nlohmann_json::nlohmann_json)

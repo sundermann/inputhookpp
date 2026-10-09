@@ -1,24 +1,73 @@
 #include "inputhook.h"
 
-#include <thread>
-#include <sys/stat.h>
-#include <fstream>
-#include <format>
+#include <nlohmann/json.hpp>
+
+#include <sys/eventfd.h>
+#include <sys/inotify.h>
+#include <poll.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <format>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <limits>
+#include <utility>
+#include <stdexcept>
 
+namespace {
+class FileDescriptor {
+public:
+    explicit FileDescriptor(int fd) noexcept : m_fd(fd) {}
+    ~FileDescriptor() {
+        if (m_fd != -1) {
+            ::close(m_fd);
+        }
+    }
 
-InputHook::InputHook() {
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    [[nodiscard]] int get() const noexcept { return m_fd; }
+    [[nodiscard]] explicit operator bool() const noexcept { return m_fd != -1; }
+
+private:
+    int m_fd;
+};
+
+}
+
+InputHook& InputHook::instance() {
+    // ezinject keeps this library mapped and the installed hooks retain this object.
+    // Keep it alive through process teardown, including calls from other destructors.
+    static auto* const hook = new InputHook(std::filesystem::path(CONFIG_LOCATION));
+    return *hook;
+}
+
+InputHook::InputHook(std::filesystem::path configPath) : m_configPath(std::move(configPath)) {
     gum_init();
     INFO("Frida gum initialized");
 
-    INFO("Starting keybind thread");
-    std::thread(&InputHook::watchConfigFile, this).detach();
-
-    m_interceptor = gum_interceptor_obtain();
+    m_interceptor.reset(gum_interceptor_obtain());
     if (!m_interceptor) {
-        ERR("Failed to obtain interceptor");
-        return;
+        throw std::runtime_error("Failed to obtain interceptor");
     }
+    INFO("Starting keybind thread");
+    m_configThread = std::jthread([this](std::stop_token stop) {
+        try {
+            watchConfigFile(stop);
+        } catch (const std::exception& error) {
+            ERR("Config watcher failed: %s", error.what());
+        }
+    });
+
     INFO("Resolving functions");
     resolveFunctions();
     INFO("Applying hooks");
@@ -36,163 +85,275 @@ void InputHook::resolveFunctions() {
 }
 
 void InputHook::applyHooks() {
-    if (orig_lginput_uinput_send_button) {
-        INFO("Replacing lginput_uinput_send_button");
-        gum_interceptor_replace(m_interceptor,
-                                reinterpret_cast<gpointer>(orig_lginput_uinput_send_button),
-                                reinterpret_cast<gpointer>(&InputHook::trampoline_lginput),
-                                this,
-                                reinterpret_cast<gpointer*>(&orig_lginput_uinput_send_button)
-        );
+    std::array<gpointer, 3> installed{};
+    std::size_t installedCount = 0;
+    gum_interceptor_begin_transaction(m_interceptor.get());
+    try {
+        const auto replace = [&](auto& original, auto replacement, const char* name) {
+            if (!original) {
+                return;
+            }
+            const auto target = reinterpret_cast<gpointer>(original);
+            const auto result = gum_interceptor_replace(m_interceptor.get(), target,
+                reinterpret_cast<gpointer>(replacement), this, reinterpret_cast<gpointer*>(&original));
+            if (result != GUM_REPLACE_OK) {
+                throw std::runtime_error(std::format("Failed to install {} hook (Frida error {})", name,
+                                                     static_cast<int>(result)));
+            }
+            installed[installedCount++] = target;
+        };
+        replace(orig_lginput_uinput_send_button, &InputHook::trampoline_lginput, "lginput_uinput_send_button");
+        replace(orig_MICOM_FuncWriteKeyEvent, &InputHook::trampoline_MICOM_FuncWriteKeyEvent, "MICOM_FuncWriteKeyEvent");
+        replace(orig_write, &InputHook::trampoline_write, "write");
+        if (installedCount == 0) {
+            throw std::runtime_error("No supported input functions or write fallback found");
+        }
+    } catch (...) {
+        while (installedCount != 0) {
+            gum_interceptor_revert(m_interceptor.get(), installed[--installedCount]);
+        }
+        gum_interceptor_end_transaction(m_interceptor.get());
+        throw;
     }
-    if (orig_MICOM_FuncWriteKeyEvent) {
-        INFO("Replacing MICOM_FuncWriteKeyEvent");
-        gum_interceptor_replace(m_interceptor,
-                                reinterpret_cast<gpointer>(orig_MICOM_FuncWriteKeyEvent),
-                                reinterpret_cast<gpointer>(&InputHook::trampoline_MICOM_FuncWriteKeyEvent),
-                                this,
-                                reinterpret_cast<gpointer*>(&orig_MICOM_FuncWriteKeyEvent)
-        );
-    }
-
-    if (orig_write) {
-        INFO("Replacing write");
-        gum_interceptor_replace(m_interceptor,
-                                reinterpret_cast<gpointer>(orig_write),
-                                reinterpret_cast<gpointer>(&InputHook::trampoline_write),
-                                this,
-                                reinterpret_cast<gpointer*>(&orig_write)
-        );
-    }
+    // Publish the replacements only after every original function pointer is ready.
+    gum_interceptor_end_transaction(m_interceptor.get());
+    if (orig_lginput_uinput_send_button) INFO("Installed lginput_uinput_send_button hook");
+    if (orig_MICOM_FuncWriteKeyEvent) INFO("Installed MICOM_FuncWriteKeyEvent hook");
+    if (orig_write) INFO("Installed write hook");
 }
 
-bool InputHook::loadKeybinds() {
-    std::unique_lock lock(m_mutex);
-    std::ifstream file(CONFIG_LOCATION.data());
-    if (!file.is_open()) {
-        ERR("Failed to open keybinds file: %s", CONFIG_LOCATION.data());
-        return false;
+std::expected<void, std::string> InputHook::loadKeybinds() {
+    std::ifstream file(m_configPath);
+    if (!file) {
+        return std::unexpected(std::format("Failed to open keybinds file: {}", m_configPath.string()));
     }
     try {
-        file >> m_keybinds;
-    } catch (const nlohmann::json::parse_error& e) {
-        ERR("Failed to parse keybinds file: %s", e.what());
-        file.close();
-        return false;
-    }
-    file.close();
-    return true;
-}
-
-[[noreturn]] void InputHook::watchConfigFile() {
-    struct stat file_stat{};
-    time_t last_mtime = 0;
-    while (true) {
-        if (stat(CONFIG_LOCATION.data(), &file_stat) == 0) {
-            if (file_stat.st_mtime != last_mtime) {
-                last_mtime = file_stat.st_mtime;
-                if (!loadKeybinds()) {
-                    ERR("Failed to load keybinds");
-                }
-                INFO("Keybinds reloaded due to config file change");
-            }
+        auto compiled = compileKeybindings(nlohmann::json::parse(file));
+        if (!compiled) {
+            return std::unexpected(std::move(compiled.error()));
         }
-        using namespace std::chrono_literals;
-        std::this_thread::sleep_for(1s);
+        auto keybinds = std::make_shared<const KeyBindings>(std::move(*compiled));
+        std::unique_lock lock(m_mutex);
+        m_keybinds.swap(keybinds);
+    } catch (const nlohmann::json::exception& error) {
+        return std::unexpected(std::format("Failed to parse keybinds file: {}", error.what()));
     }
+    return {};
 }
 
-void InputHook::launch(const std::string& cmd) {
-    if (cmd.empty()) {
-        ERR("Command is empty");
+void InputHook::watchConfigFile(std::stop_token stop) {
+    const auto reloadKeybinds = [this] {
+        if (auto result = loadKeybinds(); !result) {
+            ERR("%s", result.error().c_str());
+        } else {
+            INFO("Keybinds loaded");
+        }
+    };
+    const FileDescriptor wakeFd(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!wakeFd) {
+        ERR("Failed to create config watcher wakeup: %s", std::strerror(errno));
+        reloadKeybinds();
         return;
     }
+    // Wake a blocked poll when the jthread receives a stop request.
+    const std::stop_callback wakeOnStop(stop, [&wakeFd] {
+        const std::uint64_t value = 1;
+        while (::write(wakeFd.get(), &value, sizeof(value)) == -1 && errno == EINTR) {}
+    });
+    const auto& configPath = m_configPath;
+    constexpr uint32_t watchMask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM |
+                                   IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF |
+                                   IN_ONLYDIR;
 
-    INFO("Launching command: %s", cmd.c_str());
-
-    FILE* proc = popen((cmd + " &").c_str(), "w");
-    if (!proc)
-        ERR("Failed to launch command: %s", cmd.c_str());
-    else
-        pclose(proc);
-}
-
-std::tuple<Action, int> InputHook::handleKey(const int keycode, const int state) {
-    std::unique_lock lock(m_mutex);
-    try {
-        if (!m_keybinds.contains(std::to_string(keycode))) {
-            return {Action::PASS, keycode};
+    while (!stop.stop_requested()) {
+        const FileDescriptor fd(inotify_init1(IN_CLOEXEC));
+        if (!fd) {
+            ERR("Failed to initialize config watcher: %s", std::strerror(errno));
+            reloadKeybinds();
+            return;
         }
 
-        const nlohmann::json keybind = m_keybinds.at(std::to_string(keycode));
-        const std::string action = keybind.value("action", "");
-        if (action == "replace") {
-            const int newKeyCode = keybind.at("keycode");
-            INFO("Key %d is replaced with %d", keycode, newKeyCode);
-            return {Action::REPLACE, newKeyCode};
-        }
-
-        if (action == "pass") {
-            INFO("Key %d is passed", keycode);
-            return {Action::PASS, keycode};
-        }
-
-        if (action == "ignore") {
-            INFO("Key %d is ignored", keycode);
-            return {Action::IGNORE, keycode};
-        }
-
-        if (action == "exec" || action == "launch") {
-            if (state == 1) {
-                if (action == "exec") {
-                    INFO("Key %d is exec", keycode);
-                    launch(keybind.at("command"));
+        // Watch each ancestor before descending, so missing or replaced directories
+        // are discovered without polling and without a gap during watch setup.
+        std::map<int, std::string> watchedChildren;
+        std::filesystem::path directory = configPath.root_path();
+        int configWatch = -1;
+        for (const auto& component : configPath.relative_path()) {
+            const int wd = inotify_add_watch(fd.get(), directory.c_str(), watchMask);
+            if (wd == -1) {
+                if (errno == ENOENT || errno == ENOTDIR) {
+                    break;
                 }
-                if (action == "launch") {
-                    INFO("Key %d is launch", keycode);
-                    nlohmann::json json;
-                    json["id"] = keybind.at("id");
-                    if (keybind.contains("params")) {
-                        json["params"] = keybind.at("params");
-                    }
-                    const std::string command =
-                            "luna-send -n 1 \"luna://com.webos.applicationManager/launch\" '" + json.dump() + "'";
-                    launch(command);
+                ERR("Failed to watch %s: %s", directory.c_str(), std::strerror(errno));
+                reloadKeybinds();
+                return;
+            }
+            watchedChildren.emplace(wd, component.string());
+            if (directory == configPath.parent_path()) {
+                configWatch = wd;
+            }
+            directory /= component;
+        }
+
+        // Install watches before loading, so changes during the load remain queued.
+        reloadKeybinds();
+
+        bool rebuildWatches = false;
+        while (!rebuildWatches && !stop.stop_requested()) {
+            std::array descriptors{
+                pollfd{.fd = fd.get(), .events = POLLIN, .revents = 0},
+                pollfd{.fd = wakeFd.get(), .events = POLLIN, .revents = 0},
+            };
+            const int ready = ::poll(descriptors.data(), descriptors.size(), -1);
+            if (ready == -1 && errno == EINTR) {
+                continue;
+            }
+            if (stop.stop_requested()) {
+                return;
+            }
+            if (ready == -1 || (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                ERR("Config watcher poll failed: %s",
+                    ready == -1 ? std::strerror(errno) : "invalid inotify descriptor");
+                return;
+            }
+            if (!(descriptors[0].revents & POLLIN)) {
+                continue;
+            }
+            alignas(inotify_event) std::array<std::byte, 4096> buffer;
+            const ssize_t bytesRead = ::read(fd.get(), buffer.data(), buffer.size());
+            if (bytesRead == -1 && errno == EINTR) {
+                continue;
+            }
+            if (bytesRead <= 0) {
+                ERR("Config watcher read failed: %s",
+                    bytesRead == 0 ? "unexpected end of stream" : std::strerror(errno));
+                return;
+            }
+
+            bool reload = false;
+            auto events = std::span{buffer}.first(static_cast<std::size_t>(bytesRead));
+            while (!events.empty()) {
+                const auto* event = reinterpret_cast<const inotify_event*>(events.data());
+                events = events.subspan(sizeof(inotify_event) + event->len);
+                if (event->mask & (IN_Q_OVERFLOW | IN_IGNORED | IN_DELETE_SELF |
+                                   IN_MOVE_SELF | IN_UNMOUNT)) {
+                    rebuildWatches = true;
+                    continue;
+                }
+                const auto child = watchedChildren.find(event->wd);
+                if (event->len == 0 || child == watchedChildren.end() ||
+                    child->second != event->name) {
+                    continue;
+                }
+                if (event->wd == configWatch) {
+                    // Editors commonly save by renaming a temporary file over the old one.
+                    reload |= (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) != 0;
+                } else if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)) {
+                    rebuildWatches = true;
                 }
             }
-            return {Action::IGNORE, keycode};
+            if (reload && !rebuildWatches) {
+                reloadKeybinds();
+            }
         }
-        return {Action::PASS, keycode};
-    } catch (const nlohmann::json::exception& e) {
-        ERR("Failed to handle key %d: %s", keycode, e.what());
-        return {Action::PASS, keycode};
+        // A fresh instance also discards stale events and watch descriptor identities.
     }
 }
 
-ssize_t InputHook::trampoline_write(const int fd, input_event_t* events, const size_t count) {
-    GumInvocationContext* ctx = gum_interceptor_get_current_invocation();
-    const gpointer ptr = gum_invocation_context_get_replacement_data(ctx);
-    return static_cast<InputHook*>(ptr)->hook_write(fd, events, count);
+void InputHook::launch(const KeyBinding& binding) {
+    std::vector<std::string> arguments;
+    if (binding.action == BindingAction::Exec) {
+        arguments = {"/bin/sh", "-c", binding.payload};
+    } else {
+        arguments = {"luna-send", "-n", "1", "luna://com.webos.applicationManager/launch", binding.payload};
+    }
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 1);
+    for (auto& argument : arguments) {
+        argv.push_back(argument.data());
+    }
+    argv.push_back(nullptr);
+    GError* error = nullptr;
+    // GLib closes inherited descriptors and reaps the child automatically.
+    const bool started = g_spawn_async(nullptr, argv.data(), nullptr, G_SPAWN_SEARCH_PATH,
+                                       nullptr, nullptr, nullptr, &error);
+    const std::unique_ptr<GError, decltype(&g_error_free)> ownedError(error, &g_error_free);
+    if (!started) {
+        throw std::runtime_error(error ? error->message : "Failed to launch child process");
+    }
 }
 
-int InputHook::trampoline_lginput(uinput_info_t* info, const int keyid, const int state) {
-    GumInvocationContext* ctx = gum_interceptor_get_current_invocation();
-    const gpointer ptr = gum_invocation_context_get_replacement_data(ctx);
-    return static_cast<InputHook*>(ptr)->hook_lginput(info, keyid, state);
+KeyResult InputHook::handleKey(const int keycode, const int state) {
+    std::shared_ptr<const KeyBindings> bindings;
+    {
+        std::shared_lock lock(m_mutex);
+        bindings = m_keybinds;
+    }
+    const auto entry = bindings->find(keycode);
+    if (entry == bindings->end()) {
+        return {Action::PASS, keycode};
+    }
+    const auto& binding = entry->second;
+    switch (binding.action) {
+    case BindingAction::Replace:
+        return {Action::REPLACE, binding.replacement};
+    case BindingAction::Pass:
+        return {Action::PASS, keycode};
+    case BindingAction::Ignore:
+        return {Action::IGNORE, keycode};
+    case BindingAction::Exec:
+    case BindingAction::Launch:
+        if (state == 1) {
+            launch(binding);
+        }
+        return {Action::IGNORE, keycode};
+    }
+    return {Action::PASS, keycode};
 }
 
-int InputHook::trampoline_MICOM_FuncWriteKeyEvent(const int fd, const uint16_t type, const uint16_t code,
-                                                  const int32_t value) {
-    GumInvocationContext* ctx = gum_interceptor_get_current_invocation();
-    const gpointer ptr = gum_invocation_context_get_replacement_data(ctx);
-    return static_cast<InputHook*>(ptr)->hook_MICOM_FuncWriteKeyEvent(fd, type, code, value);
+ssize_t InputHook::trampoline_write(const int fd, const void* events, const size_t count) noexcept {
+    const int savedErrno = errno;
+    auto* self = static_cast<InputHook*>(gum_invocation_context_get_replacement_data(
+        gum_interceptor_get_current_invocation()));
+    try {
+        return self->hook_write(fd, events, count);
+    } catch (...) {
+        // No logging here: this replaces libc write, including writes made by logging.
+        errno = savedErrno;
+        return self->orig_write(fd, events, count);
+    }
+}
+
+int InputHook::trampoline_lginput(uinput_info_t* info, const int keyid, const int state) noexcept {
+    const int savedErrno = errno;
+    auto* self = static_cast<InputHook*>(gum_invocation_context_get_replacement_data(
+        gum_interceptor_get_current_invocation()));
+    try {
+        return self->hook_lginput(info, keyid, state);
+    } catch (...) {
+        errno = savedErrno;
+        return self->orig_lginput_uinput_send_button(info, keyid, state);
+    }
+}
+
+int InputHook::trampoline_MICOM_FuncWriteKeyEvent(const int fd, const uint16_t type,
+                                                 const uint16_t code, const int32_t value) noexcept {
+    const int savedErrno = errno;
+    auto* self = static_cast<InputHook*>(gum_invocation_context_get_replacement_data(
+        gum_interceptor_get_current_invocation()));
+    try {
+        return self->hook_MICOM_FuncWriteKeyEvent(fd, type, code, value);
+    } catch (...) {
+        errno = savedErrno;
+        return self->orig_MICOM_FuncWriteKeyEvent(fd, type, code, value);
+    }
 }
 
 int InputHook::hook_lginput(uinput_info_t* info, const int keyid, const int state) {
     const int uinput_code = info->keybinds[keyid].uinput_code;
     INFO("lginput_uinput_send_button called: keyid=%d, state=%d uinput_code=%d", keyid, state, uinput_code);
 
-    auto [action, newKeycode] = handleKey(info->keybinds[keyid].uinput_code, state);
+    const auto [action, newKeycode] = handleKey(info->keybinds[keyid].uinput_code, state);
 
     if (action == Action::REPLACE) {
         const int orig = info->keybinds[keyid].uinput_code;
@@ -214,7 +375,7 @@ int InputHook::hook_MICOM_FuncWriteKeyEvent(const int fd, const uint16_t type, c
     INFO("MICOM_FuncWriteKeyEvent called: fd=%d, type=%d, code=%d, value=%d", fd, type, code, value);
 
     if (type != 0) {
-        auto [action, newKeycode] = handleKey(code, value);
+        const auto [action, newKeycode] = handleKey(code, value);
 
         if (action == Action::REPLACE) {
             return orig_MICOM_FuncWriteKeyEvent(fd, type, newKeycode, value);
@@ -228,33 +389,70 @@ int InputHook::hook_MICOM_FuncWriteKeyEvent(const int fd, const uint16_t type, c
     return orig_MICOM_FuncWriteKeyEvent(fd, type, code, value);
 }
 
-ssize_t InputHook::hook_write(const int fd, input_event_t* events, const size_t count) {
-    const std::string fdPath = std::format("/proc/self/fd/{}", fd);
-    std::error_code error;
-    const std::filesystem::path path = std::filesystem::read_symlink(fdPath, error);
-
-    if (!error && path == "/dev/uinput" && count >= 16 && events[0].type == 1) {
-        INFO("write to /dev/uinput: code=%d, value=%d", events[0].code, events[0].value);
-        auto [action, newKeycode] = handleKey(events[0].code, events[0].value);
-
-        if (action == Action::REPLACE) {
-            events[0].code = newKeycode;
-        }
-
-        if (action == Action::IGNORE) {
-            return static_cast<ssize_t>(count);
-        }
+ssize_t InputHook::hook_write(const int fd, const void* events, const size_t count) {
+    const int savedErrno = errno;
+    if (!events || count < sizeof(input_event_t) || count % sizeof(input_event_t) != 0 ||
+        count > static_cast<size_t>(std::numeric_limits<ssize_t>::max())) {
+        return orig_write(fd, events, count);
     }
+    const auto fdPath = std::format("/proc/self/fd/{}", fd);
+    std::error_code error;
+    const auto path = std::filesystem::read_symlink(fdPath, error);
+    errno = savedErrno;
+    if (error || path != "/dev/uinput") {
+        return orig_write(fd, events, count);
+    }
+    return writeEvents(fd, events, count);
+}
 
-    return orig_write(fd, events, count);
+ssize_t InputHook::writeEvents(const int fd, const void* events, const size_t count) {
+    const int savedErrno = errno;
+    const auto input = static_cast<const std::byte*>(events);
+    const size_t eventCount = count / sizeof(input_event_t);
+    std::vector<input_event_t> output;
+    std::vector<size_t> sourceOffsets;
+    output.reserve(eventCount);
+    sourceOffsets.reserve(eventCount);
+    for (size_t index = 0; index < eventCount; ++index) {
+        // write's buffer may be read-only or unaligned.
+        input_event_t event;
+        std::memcpy(&event, input + index * sizeof(event), sizeof(event));
+        if (event.type == 1) {
+            const auto [action, code] = handleKey(event.code, event.value);
+            if (action == Action::IGNORE) {
+                continue;
+            }
+            if (action == Action::REPLACE) {
+                event.code = static_cast<uint16_t>(code);
+            }
+        }
+        output.push_back(event);
+        sourceOffsets.push_back(index * sizeof(event));
+    }
+    errno = savedErrno;
+    if (output.empty()) {
+        return static_cast<ssize_t>(count);
+    }
+    const size_t outputBytes = output.size() * sizeof(input_event_t);
+    const ssize_t written = orig_write(fd, output.data(), outputBytes);
+    if (written <= 0) {
+        return written;
+    }
+    if (static_cast<size_t>(written) == outputBytes) {
+        return static_cast<ssize_t>(count);
+    }
+    // Translate a short write back into bytes consumed from the caller's buffer.
+    const size_t complete = static_cast<size_t>(written) / sizeof(input_event_t);
+    const size_t remainder = static_cast<size_t>(written) % sizeof(input_event_t);
+    return static_cast<ssize_t>(sourceOffsets.at(complete) + remainder);
 }
 
 extern "C" {
-int lib_loginit(log_config_t* log_cfg) {
+int lib_loginit(log_config_t*) {
     return -1;
 }
 
-int lib_preinit(struct injcode_user* user) {
+int lib_preinit(injcode_user* user) {
     /**
      * this is needed for hooks pointing to code in this library
      * if we don't set this, dlclose() will be called and the hooks will segfault when called
@@ -265,9 +463,17 @@ int lib_preinit(struct injcode_user* user) {
     return 0;
 }
 
-int lib_main(int argc, char* argv[]) {
-    INFO("InputHook initialized");
-    new InputHook();
-    return 0;
+int lib_main(int, char*[]) {
+    try {
+        static_cast<void>(InputHook::instance());
+        INFO("InputHook initialized");
+        return 0;
+    } catch (const std::exception& error) {
+        ERR("Failed to initialize InputHook: %s", error.what());
+        return -1;
+    } catch (...) {
+        ERR("Failed to initialize InputHook: unknown exception");
+        return -1;
+    }
 }
 }
